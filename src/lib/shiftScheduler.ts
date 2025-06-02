@@ -147,39 +147,40 @@ export class ShiftScheduler {
   private hasShiftRuleConflict(employee: Employee, date: Date, shiftType: ShiftType): string | null {
     const dateStr = date.toISOString().split('T')[0];
 
-    // Check forbidden sequence rules
-    const forbiddenRules = this.options.shiftRules.filter(r => r.type === 'forbidden_sequence');
+    for (const rule of this.options.shiftRules) {
+      if (rule.type === 'forbidden_sequence' && rule.fromShiftId && (rule.toShiftId || rule.toShiftIds?.length)) {
+        // Check same day conflicts
+        if (rule.sameDay) {
+          const existingAssignment = this.assignments.find(a =>
+            a.employeeId === employee.id &&
+            a.date === dateStr &&
+            a.shiftId === rule.fromShiftId
+          );
 
-    for (const rule of forbiddenRules) {
-      // Check same day forbidden sequences
-      if (rule.sameDay) {
-        const existingAssignment = this.assignments.find(a =>
-          a.employeeId === employee.id &&
-          a.date === dateStr &&
-          a.shiftId === rule.fromShiftId
-        );
-
-        if (existingAssignment &&
-            ((rule.toShiftIds && rule.toShiftIds.includes(shiftType.id)) ||
-             rule.toShiftId === shiftType.id)) {
-          return `Forbidden same-day sequence: ${rule.name}`;
+          if (existingAssignment &&
+              ((rule.toShiftIds?.includes(shiftType.id)) ||
+               rule.toShiftId === shiftType.id)) {
+            return `Forbidden same-day sequence: ${rule.name}`;
+          }
         }
-      } else {
-        // Check next day forbidden sequences
-        const previousDay = new Date(date);
-        previousDay.setDate(date.getDate() - 1);
-        const previousDateStr = previousDay.toISOString().split('T')[0];
 
-        const previousAssignment = this.assignments.find(a =>
-          a.employeeId === employee.id &&
-          a.date === previousDateStr &&
-          a.shiftId === rule.fromShiftId
-        );
+        // Check next day conflicts (when sameDay is false)
+        if (!rule.sameDay) {
+          const previousDate = new Date(date);
+          previousDate.setDate(date.getDate() - 1);
+          const previousDateStr = previousDate.toISOString().split('T')[0];
 
-        if (previousAssignment &&
-            ((rule.toShiftIds && rule.toShiftIds.includes(shiftType.id)) ||
-             rule.toShiftId === shiftType.id)) {
-          return `Forbidden next-day sequence: ${rule.name}`;
+          const previousAssignment = this.assignments.find(a =>
+            a.employeeId === employee.id &&
+            a.date === previousDateStr &&
+            a.shiftId === rule.fromShiftId
+          );
+
+          if (previousAssignment &&
+              ((rule.toShiftIds?.includes(shiftType.id)) ||
+               rule.toShiftId === shiftType.id)) {
+            return `Forbidden next-day sequence: ${rule.name}`;
+          }
         }
       }
     }
@@ -206,6 +207,62 @@ export class ShiftScheduler {
     return null;
   }
 
+  private enforceMandatoryFollowUps(): void {
+    const mandatoryRules = this.options.shiftRules.filter(r => r.type === 'mandatory_follow_up');
+
+    for (const rule of mandatoryRules) {
+      if (!rule.toShiftId) continue;
+
+      // Find all assignments with the "from" shift
+      const fromAssignments = this.assignments.filter(a =>
+        a.shiftId === rule.fromShiftId && !a.isFollowUp
+      );
+
+      for (const fromAssignment of fromAssignments) {
+        const employee = this.options.employees.find(e => e.id === fromAssignment.employeeId);
+        const toShiftType = this.options.shiftTypes.find(st => st.id === rule.toShiftId);
+        const date = new Date(fromAssignment.date);
+
+        if (!employee || !toShiftType) continue;
+
+        // Check if employee already has the mandatory follow-up
+        const existingFollowUp = this.assignments.find(a =>
+          a.employeeId === employee.id &&
+          a.date === fromAssignment.date &&
+          a.shiftId === rule.toShiftId
+        );
+
+        if (existingFollowUp) continue;
+
+        // Check if the mandatory follow-up slot is available
+        const slotOccupied = this.assignments.some(a =>
+          a.date === fromAssignment.date &&
+          a.shiftId === rule.toShiftId &&
+          !a.isFollowUp
+        );
+
+        if (slotOccupied) {
+          this.conflicts.push(`Mandatory follow-up conflict: ${employee.firstName} ${employee.lastName} needs ${toShiftType.name} on ${fromAssignment.date} but slot is occupied`);
+          continue;
+        }
+
+        // Check if employee is qualified and available
+        if (!this.isEmployeeQualified(employee, toShiftType)) {
+          this.conflicts.push(`Mandatory follow-up conflict: ${employee.firstName} ${employee.lastName} not qualified for ${toShiftType.name} on ${fromAssignment.date}`);
+          continue;
+        }
+
+        if (!this.isEmployeeAvailable(employee, date, toShiftType)) {
+          this.conflicts.push(`Mandatory follow-up conflict: ${employee.firstName} ${employee.lastName} not available for ${toShiftType.name} on ${fromAssignment.date}`);
+          continue;
+        }
+
+        // Assign the mandatory follow-up
+        this.assignShift(employee, date, toShiftType, true);
+      }
+    }
+  }
+
   private sortEmployeesByWorkload(): Employee[] {
     return [...this.options.employees].sort((a, b) => {
       const workloadA = this.employeeWorkloads[a.id];
@@ -222,23 +279,25 @@ export class ShiftScheduler {
   private assignShift(employee: Employee, date: Date, shiftType: ShiftType, isFollowUp = false): boolean {
     const dateStr = date.toISOString().split('T')[0];
 
-    // Check if slot is already occupied
+    // Check if slot is already occupied (but allow follow-ups to be added to occupied slots)
     const existingAssignment = this.assignments.find(a =>
       a.date === dateStr &&
-      a.shiftId === shiftType.id &&
-      !a.isFollowUp
+      a.shiftId === shiftType.id
     );
 
     if (existingAssignment && !isFollowUp) return false;
 
-    // Check if employee already has an assignment on this day
-    const employeeExistingAssignment = this.assignments.find(a =>
-      a.employeeId === employee.id &&
-      a.date === dateStr &&
-      !a.isFollowUp
-    );
+    // For follow-ups, allow multiple assignments per employee per day
+    // For regular assignments, check if employee already has a main assignment this day
+    if (!isFollowUp) {
+      const employeeExistingAssignment = this.assignments.find(a =>
+        a.employeeId === employee.id &&
+        a.date === dateStr &&
+        !a.isFollowUp
+      );
 
-    if (employeeExistingAssignment && !isFollowUp) return false;
+      if (employeeExistingAssignment) return false;
+    }
 
     // Create assignment
     const assignment: ShiftAssignment = {
@@ -282,6 +341,9 @@ export class ShiftScheduler {
       currentDate.setDate(currentDate.getDate() + 1);
     }
 
+    // After all regular assignments, enforce mandatory follow-ups
+    this.enforceMandatoryFollowUps();
+
     return {
       assignments: this.assignments,
       conflicts: this.conflicts,
@@ -306,7 +368,14 @@ export class ShiftScheduler {
       }
     }
 
-    // Assign shifts
+    // Sort shifts by priority (early shifts first, then priority)
+    requiredShifts.sort((a, b) => {
+      const aStart = Number.parseInt(a.shiftType.startTime.split(':')[0]);
+      const bStart = Number.parseInt(b.shiftType.startTime.split(':')[0]);
+      return aStart - bStart;
+    });
+
+    // Assign shifts with multiple strategies
     for (const { shiftType, count } of requiredShifts) {
       const currentAssignments = this.assignments.filter(a =>
         a.date === dateStr &&
@@ -317,44 +386,90 @@ export class ShiftScheduler {
       const needed = count - currentAssignments;
 
       for (let i = 0; i < needed; i++) {
-        const sortedEmployees = this.sortEmployeesByWorkload();
         let assigned = false;
 
-        for (const employee of sortedEmployees) {
-          // Skip if employee already has assignment this day (non-follow-up)
-          const hasAssignment = this.assignments.some(a =>
-            a.employeeId === employee.id &&
-            a.date === dateStr &&
-            !a.isFollowUp
-          );
+        // Strategy 1: Try with all rules enforced
+        assigned = this.tryAssignShiftWithStrategy(date, shiftType, true);
 
-          if (hasAssignment) continue;
+        // Strategy 2: If failed, try with relaxed rule checking
+        if (!assigned) {
+          assigned = this.tryAssignShiftWithStrategy(date, shiftType, false);
+        }
 
-          // Check qualifications
-          if (!this.isEmployeeQualified(employee, shiftType)) continue;
-
-          // Check availability
-          if (!this.isEmployeeAvailable(employee, date, shiftType)) continue;
-
-          // Check shift rules
-          const ruleConflict = this.hasShiftRuleConflict(employee, date, shiftType);
-          if (ruleConflict) {
-            this.conflicts.push(`${employee.firstName} ${employee.lastName} on ${dateStr}: ${ruleConflict}`);
-            continue;
-          }
-
-          // Assign the shift
-          if (this.assignShift(employee, date, shiftType)) {
-            assigned = true;
-            break;
-          }
+        // Strategy 3: Emergency assignment (only basic checks)
+        if (!assigned) {
+          assigned = this.tryEmergencyAssignment(date, shiftType);
         }
 
         if (!assigned) {
-          this.conflicts.push(`Unassigned shift: ${shiftType.name} on ${dateStr}`);
+          this.conflicts.push(`Unassigned shift: ${shiftType.name} on ${dateStr} (Position ${i + 1})`);
         }
       }
     }
+  }
+
+  private tryAssignShiftWithStrategy(date: Date, shiftType: ShiftType, enforceRules: boolean): boolean {
+    const dateStr = date.toISOString().split('T')[0];
+    const sortedEmployees = this.sortEmployeesByWorkload();
+
+    for (const employee of sortedEmployees) {
+      // Skip if employee already has assignment this day (non-follow-up)
+      const hasAssignment = this.assignments.some(a =>
+        a.employeeId === employee.id &&
+        a.date === dateStr &&
+        !a.isFollowUp
+      );
+
+      if (hasAssignment) continue;
+
+      // Check qualifications
+      if (!this.isEmployeeQualified(employee, shiftType)) continue;
+
+      // Check availability
+      if (!this.isEmployeeAvailable(employee, date, shiftType)) continue;
+
+      // Check shift rules (only if enforcing)
+      if (enforceRules) {
+        const ruleConflict = this.hasShiftRuleConflict(employee, date, shiftType);
+        if (ruleConflict) {
+          continue; // Don't add to conflicts yet, try other employees first
+        }
+      }
+
+      // Assign the shift
+      if (this.assignShift(employee, date, shiftType)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private tryEmergencyAssignment(date: Date, shiftType: ShiftType): boolean {
+    const dateStr = date.toISOString().split('T')[0];
+    const sortedEmployees = this.sortEmployeesByWorkload();
+
+    for (const employee of sortedEmployees) {
+      // Skip if employee already has assignment this day (non-follow-up)
+      const hasAssignment = this.assignments.some(a =>
+        a.employeeId === employee.id &&
+        a.date === dateStr &&
+        !a.isFollowUp
+      );
+
+      if (hasAssignment) continue;
+
+      // Only check basic qualifications, ignore availability and rules
+      if (!this.isEmployeeQualified(employee, shiftType)) continue;
+
+      // Assign the shift with conflict note
+      if (this.assignShift(employee, date, shiftType)) {
+        this.conflicts.push(`Emergency assignment: ${employee.firstName} ${employee.lastName} assigned to ${shiftType.name} on ${dateStr} (may violate availability or rules)`);
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private countUnassignedShifts(): number {
